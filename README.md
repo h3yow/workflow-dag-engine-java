@@ -1,16 +1,22 @@
 # DAG 工作流调度服务（本地可运行）
 
 一个基于 Spring Boot 3 / Java 21 的本地 DAG 工作流调度服务：按步骤依赖关系调度执行，
-在**步骤失败、服务重启、重复提交**三种情况下都给出可解释、可复现的结果。
+在**步骤失败、服务重启、重复提交**三种情况下都给出可解释、可复现的结果；
+并支持**步骤自动重试**与**失败工作流续跑**。
 
 ## 1. 模型与状态
 
 - `WorkflowDef`：`workflowId`（客户端提供的**幂等键**）+ 步骤列表；
-  每个步骤 `StepDef` 包含 `id`、`type`、`dependsOn`、`param`、`timeoutMs`。
+  每个步骤 `StepDef` 包含 `id`、`type`、`dependsOn`、`param`、`timeoutMs`，
+  以及可选的自动重试配置 `maxRetries`、`retryDelayMs`（见第 4 节）。
 - 步骤状态 `StepStatus`：`PENDING → RUNNING → SUCCESS / FAILED`，失败后未执行的步骤为 `SKIPPED`。
-  `SUCCESS / FAILED / SKIPPED` 均为终态，**终态永不重跑**。
+  `SUCCESS / FAILED / SKIPPED` 均为终态，**终态永不重跑**（续跑是唯一例外入口，见第 5 节：
+  续跑只把 `FAILED/SKIPPED` 重置为 `PENDING`，`SUCCESS` 依然绝不重跑）。
 - 工作流状态 `WorkflowStatus`：`RUNNING / SUCCESS / FAILED`。
-- 每次状态流转都带时间戳、`attempts` 与失败溯源 `FailureInfo`，并以 JSON 落盘。
+- 每次状态流转都带时间戳、`attempts` 与失败溯源 `FailureInfo`，并以 JSON 落盘；
+  每次尝试（含重试）在 `steps[id].attemptRecords` 中留下一条记录：
+  第几次尝试、起止时间、是否成功、失败分类与消息，`finishedAt=0` 表示该次尝试尚无结果
+  （执行中，或服务重启被中断——恢复时会被补记为"中断"）。
 
 内置步骤类型：
 
@@ -56,7 +62,56 @@
 | `STEP_EXCEPTION` | 步骤处理器内部抛异常 | 步骤 FAILED，工作流 FAILED |
 | `TIMEOUT` | 执行超过 `timeoutMs`（默认 `workflow.default-timeout-ms=5000`） | 步骤 FAILED，工作流 FAILED |
 
-## 4. 断点恢复与幂等提交
+## 4. 步骤自动重试
+
+步骤定义可携带两个可选字段（缺省均为 0，即不重试）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `maxRetries` | 允许的重试次数（不含首次执行），总尝试上限 = `1 + maxRetries` |
+| `retryDelayMs` | 两次尝试之间的等待间隔（毫秒） |
+
+语义：
+
+- 步骤因 `STEP_EXCEPTION`（内部报错）或 `TIMEOUT`（超时）失败时，若已派发次数
+  未达到 `1 + maxRetries`，步骤回到 `PENDING`，等待 `retryDelayMs` 后由调度泵重新派发；
+  只有次数用尽才置为 `FAILED`，并按第 3 节的既有规则停掉后续步骤。
+- 重试的每次派发与首次执行走同一条路径：同样占用全局并发槽位，
+  **不会突破 `workflow.max-concurrency` 上限**（有单测实测）。
+- 每次尝试都追加一条 `attemptRecords` 记录并落盘，`attempts` 同步累加；
+  最终失败时 `steps[id].failure` 保留最后一次尝试的失败分类，
+  历史每次尝试的分类可在 `attemptRecords` 中逐条查看。
+- 重试等待期间服务重启：步骤以 `PENDING` 落盘，恢复后按既有规则重新派发，
+  已累加的 `attempts` 不回退、不重复累加。
+
+**兼容性**：未配置重试的老定义（`maxRetries=0`）行为与引入重试之前完全一致——
+失败一次即终态（有专门用例 `RetryTest.definitionWithoutRetryKeepsLegacyBehavior` 守护）；
+老版本落盘的状态文件不含重试字段与尝试记录，反序列化后按缺省值处理，可直接加载。
+
+## 5. 失败工作流续跑
+
+`POST /api/workflows/{workflowId}/resume` 对一个已 `FAILED` 的工作流发起续跑，
+**只补跑未成功的部分**：
+
+- 已 `SUCCESS` 的步骤原样保留、绝不重跑，其 `attempts` 与 `attemptRecords` 不动；
+- `FAILED` 与被级联 `SKIPPED` 的步骤重置为 `PENDING`，按依赖关系重新调度
+  （上游已成功的直接复用结果，被跳过的步骤这次会补跑）；
+- 重置与状态落盘在同一把锁内完成，续跑期间服务重启按第 6 节断点恢复规则继续，
+  已成功的不重跑、已记录的尝试次数不重复累加；
+- 续跑结束后的整体状态与每步结果通过 `GET /api/workflows/{workflowId}` 正常查询，
+  与首次执行的呈现完全一致。
+
+**幂等语义**：
+
+- 并发/重复触发续跑：只有一个请求真正受理（`deduplicated=false`），
+  其余请求在续跑进行中或已成功结束时命中幂等，返回**同一份执行**
+  （`deduplicated=true`），不会各跑一遍；
+- 对 `SUCCESS` 工作流续跑：无操作，直接返回既有执行（`deduplicated=true`）；
+- 对不存在的 `workflowId` 续跑：HTTP 404 `WORKFLOW_NOT_FOUND`；
+- 已结束工作流的**重复提交**（`POST /api/workflows`）行为不变，仍是返回既有执行，
+  不会触发第二次执行——续跑只能显式通过 resume 接口发起。
+
+## 6. 断点恢复与幂等提交
 
 **持久化**：每个工作流落盘为 `<data-dir>/<workflowId>.json`，写入采用"临时文件 + 原子 rename"，
 每次步骤状态变化都会持久化，因此任意时刻磁盘上都是完整状态。
@@ -70,15 +125,16 @@
 
 **幂等提交**（`POST /api/workflows`）：
 
-- 相同 `workflowId` + 语义相同的定义（步骤顺序无关，比较 id/type/deps/param/timeout）：
+- 相同 `workflowId` + 语义相同的定义（步骤顺序无关，比较 id/type/deps/param/timeout/重试配置）：
   返回 `{"deduplicated":true,"execution":...}`，即既有执行结果，**不产生第二次执行**；
 - 相同 `workflowId` 但定义不同：HTTP 409 `DEFINITION_CONFLICT`。
 
-## 5. HTTP 接口
+## 7. HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/workflows` | 提交工作流（异步执行，立即返回当前状态） |
+| POST | `/api/workflows/{workflowId}/resume` | 失败续跑（幂等，只补跑未成功步骤；不存在返回 404） |
 | GET | `/api/workflows/{workflowId}` | 查询执行进度与溯源（不存在返回 404） |
 | GET | `/api/workflows` | 列出全部工作流 |
 
@@ -96,26 +152,34 @@
 }
 ```
 
-## 6. 本地验证方法
+## 8. 本地验证方法
 
 需要 JDK 21、Maven 3.6+。
 
-### 6.1 运行测试
+### 8.1 运行测试
 
 ```bash
 mvn test
 ```
 
-测试清单（共 19 个用例，日志中统一打印**工作流标识、步骤依赖关系、各步骤最终状态**）：
+测试清单（共 30 个用例，日志中统一打印**工作流标识、步骤依赖关系、各步骤最终状态**）：
 
 - `DagValidationTest`：缺失依赖 / 自引用 / 成环拒绝原因可区分；拓扑序满足依赖且与提交顺序无关；
 - `StepFailureTest`：STEP_EXCEPTION 传播、TIMEOUT 分类、下游 SKIPPED、并发上限实测、
   在途独立步骤跑完且不重跑、未知类型作为 DEFINITION_ERROR 被拒；
+- `RetryTest`：重试最后成功、次数耗尽才算失败、超时也走重试、重试不突破并发上限、
+  未配重试的老定义行为不变；
+- `ResumeTest`：续跑只补未成功部分、并发续跑只生效一次、已成功工作流续跑为空操作、
+  未知 id 404、续跑中途重启可断点恢复且不重复执行；
 - `RestartRecoveryTest`：重复提交幂等、同 id 不同定义 409、kill 后重启已完成步骤不重跑、
   RUNNING 步骤恢复重跑、终态工作流重启后保持一致；
-- `WorkflowApiIT`：基于 MockMvc 的 HTTP 端到端冒烟（成功、成环 400、幂等、409）。
+- `WorkflowApiTest`：基于 MockMvc 的 HTTP 端到端冒烟（成功、成环 400、幂等、409、
+  续跑受理/幂等空操作/未知 id 404）。
 
-### 6.2 启动服务并用 curl 验证
+测试不依赖上一次运行留下的状态：使用固定路径数据目录的用例会在 Spring 上下文创建前
+先清理旧状态文件，干净环境与连续多次运行结果一致。
+
+### 8.2 启动服务并用 curl 验证
 
 ```bash
 mvn spring-boot:run \
@@ -137,7 +201,28 @@ curl -s -X POST localhost:8080/api/workflows -H 'Content-Type: application/json'
   -d '{"workflowId":"demo","steps":[{"id":"a","type":"noop","dependsOn":[]}]}'
 ```
 
-### 6.3 手工验证重启恢复
+### 8.3 手工验证自动重试与失败续跑
+
+```bash
+# 自动重试：fail 步骤配 maxRetries=2，会尝试 3 次后 FAILED；
+# GET 可见 steps.bad.attempts=3 与 3 条 attemptRecords
+curl -s -X POST localhost:8080/api/workflows -H 'Content-Type: application/json' \
+  -d '{"workflowId":"retry-demo","steps":[
+        {"id":"bad","type":"fail","param":"boom","dependsOn":[],"maxRetries":2,"retryDelayMs":500},
+        {"id":"after","type":"noop","dependsOn":["bad"]}]}'
+sleep 3 && curl -s localhost:8080/api/workflows/retry-demo
+
+# 失败续跑：把上面的 fail 换成会成功的类型无法直接改定义（同 id 不同定义会 409），
+# 因此用新 id 演示完整链路——先失败，再续跑（此处 after 依赖 bad，bad 仍会失败，
+# 续跑用于演示幂等：重复调用返回 deduplicated=true 的同一份执行）
+curl -s -X POST localhost:8080/api/workflows/retry-demo/resume
+curl -s -X POST localhost:8080/api/workflows/retry-demo/resume   # 幂等命中，不会各跑一遍
+
+# 不存在的 id 续跑 → 404 WORKFLOW_NOT_FOUND
+curl -i -X POST localhost:8080/api/workflows/no-such/resume
+```
+
+### 8.4 手工验证重启恢复
 
 ```bash
 mvn package -DskipTests
@@ -147,7 +232,7 @@ java -jar target/workflow-dag-engine-java-1.0-SNAPSHOT.jar --workflow.data-dir=/
 # GET 接口可见已完成步骤 attempts=1 保持不变，被中断步骤 attempts 增加并继续执行。
 ```
 
-## 7. 配置项（application.properties）
+## 9. 配置项（application.properties）
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -155,7 +240,7 @@ java -jar target/workflow-dag-engine-java-1.0-SNAPSHOT.jar --workflow.data-dir=/
 | `workflow.max-concurrency` | `4` | 步骤执行全局并发上限 |
 | `workflow.default-timeout-ms` | `5000` | 步骤默认超时；步骤 `timeoutMs>0` 时单步覆盖 |
 
-## 8. 代码结构
+## 10. 代码结构
 
 ```
 model/       枚举与状态模型（定义、执行记录、失败溯源）

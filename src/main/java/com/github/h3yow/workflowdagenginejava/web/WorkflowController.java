@@ -13,6 +13,7 @@ import java.util.List;
  * 工作流 HTTP 接口：
  * <ul>
  *   <li>POST /api/workflows 提交（幂等）；</li>
+ *   <li>POST /api/workflows/{id}/resume 失败续跑（幂等，只补跑未成功步骤）；</li>
  *   <li>GET  /api/workflows/{id} 查询进度与溯源；</li>
  *   <li>GET  /api/workflows 列出全部。</li>
  * </ul>
@@ -30,6 +31,12 @@ public class WorkflowController {
     @PostMapping
     public SubmitResponse submit(@RequestBody WorkflowDef def) {
         SubmitOutcome outcome = engine.submit(def);
+        return new SubmitResponse(outcome.deduplicated(), outcome.execution());
+    }
+
+    @PostMapping("/{workflowId}/resume")
+    public SubmitResponse resume(@PathVariable String workflowId) {
+        SubmitOutcome outcome = engine.resume(workflowId);
         return new SubmitResponse(outcome.deduplicated(), outcome.execution());
     }
 

@@ -1,8 +1,12 @@
 package com.github.h3yow.workflowdagenginejava.model;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * 单个步骤的执行进度与溯源记录，会被持久化。
  * startedAt/finishedAt 为 epoch 毫秒，0 表示尚未发生。
+ * attempts 为已派发的尝试次数（含自动重试），attemptRecords 记录每次尝试的起止与结果。
  */
 public class StepRun {
     private String stepId;
@@ -11,6 +15,7 @@ public class StepRun {
     private long finishedAt;
     private int attempts;
     private FailureInfo failure;
+    private List<AttemptRecord> attemptRecords = new ArrayList<>();
 
     public StepRun() {
     }
@@ -66,5 +71,13 @@ public class StepRun {
 
     public void setFailure(FailureInfo failure) {
         this.failure = failure;
+    }
+
+    public List<AttemptRecord> getAttemptRecords() {
+        return attemptRecords;
+    }
+
+    public void setAttemptRecords(List<AttemptRecord> attemptRecords) {
+        this.attemptRecords = attemptRecords == null ? new ArrayList<>() : attemptRecords;
     }
 }

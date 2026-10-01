@@ -28,6 +28,11 @@ final class TestSupport {
         return new StepDef(id, type, List.of(deps), param, timeoutMs);
     }
 
+    static StepDef step(String id, String type, String param, long timeoutMs,
+                        int maxRetries, long retryDelayMs, String... deps) {
+        return new StepDef(id, type, List.of(deps), param, timeoutMs, maxRetries, retryDelayMs);
+    }
+
     static StepDef noop(String id, String... deps) {
         return step(id, "noop", null, 0L, deps);
     }
@@ -61,8 +66,22 @@ final class TestSupport {
                 + (exec == null ? null : exec.getStatus()));
     }
 
-    /** 打印工作流标识、步骤依赖关系与每个步骤最终状态（满足测试日志溯源要求）。 */
-    static void trace(WorkflowExecution exec) {
+    /** 等待指定步骤进入期望状态，超时失败。 */
+    static void waitUntilStep(WorkflowEngine engine, String workflowId,
+                              String stepId, com.github.h3yow.workflowdagenginejava.model.StepStatus expected)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (System.currentTimeMillis() < deadline) {
+            WorkflowExecution exec = engine.get(workflowId).orElse(null);
+            if (exec != null && exec.getSteps().get(stepId).getStatus() == expected) {
+                return;
+            }
+            Thread.sleep(5);
+        }
+        throw new AssertionError("步骤 " + stepId + " 未进入 " + expected);
+    }
+
+    /** 打印工作流标识、步骤依赖关系与每个步骤最终状态（满足测试日志溯源要求）。 */    static void trace(WorkflowExecution exec) {
         Map<String, List<String>> deps = new LinkedHashMap<>();
         Map<String, String> finalStatus = new LinkedHashMap<>();
         for (StepDef s : exec.getDefinition().steps()) {
@@ -82,5 +101,24 @@ final class TestSupport {
         long elapsed = System.currentTimeMillis() - start;
         assertTrue(elapsed >= minMs, "耗时 " + elapsed + "ms 短于预期下限 " + minMs + "ms");
         assertTrue(elapsed <= maxMs, "耗时 " + elapsed + "ms 超过预期上限 " + maxMs + "ms");
+    }
+
+    /** 递归删除目录（不存在则静默跳过），用于清理固定路径的测试数据目录。 */
+    static void deleteRecursively(Path dir) {
+        if (!java.nio.file.Files.exists(dir)) {
+            return;
+        }
+        try (var stream = java.nio.file.Files.walk(dir)) {
+            stream.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            java.nio.file.Files.delete(p);
+                        } catch (java.io.IOException e) {
+                            throw new RuntimeException("清理测试目录失败: " + p, e);
+                        }
+                    });
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("清理测试目录失败: " + dir, e);
+        }
     }
 }

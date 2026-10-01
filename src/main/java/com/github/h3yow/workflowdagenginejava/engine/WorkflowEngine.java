@@ -145,6 +145,57 @@ public class WorkflowEngine {
         }
     }
 
+    /**
+     * 失败工作流续跑（幂等）：
+     * <ul>
+     *   <li>FAILED：把 FAILED/SKIPPED 步骤重置为 PENDING 后重新调度；
+     *       已 SUCCESS 的步骤原样保留、绝不重跑，已记录的尝试次数与尝试记录保留不累加；</li>
+     *   <li>RUNNING：说明已有首次执行或另一次续跑正在进行，返回既有执行（deduplicated=true），
+     *       并发重复触发只生效一次；</li>
+     *   <li>SUCCESS：没有需要补跑的部分，返回既有执行（deduplicated=true）；</li>
+     *   <li>workflowId 不存在：抛出 {@link WorkflowNotFoundException}（HTTP 404）。</li>
+     * </ul>
+     * 续跑把状态重置与状态落盘放在同一把锁内完成，之后由调度泵驱动，
+     * 跑到一半服务重启时按既有的断点恢复规则继续，已成功步骤不重跑。
+     */
+    public SubmitOutcome resume(String workflowId) {
+        ensurePools();
+        Object lock = lockFor(workflowId);
+        synchronized (lock) {
+            WorkflowExecution exec = cache.get(workflowId);
+            if (exec == null) {
+                throw new WorkflowNotFoundException("workflowId=" + workflowId + " 不存在");
+            }
+            if (exec.getStatus() == WorkflowStatus.RUNNING) {
+                log.info("[workflowId={}] 续跑幂等命中：工作流正在执行中，返回既有执行", workflowId);
+                return new SubmitOutcome(true, snapshot(exec));
+            }
+            if (exec.getStatus() == WorkflowStatus.SUCCESS) {
+                log.info("[workflowId={}] 续跑幂等命中：工作流已成功结束，无需补跑", workflowId);
+                return new SubmitOutcome(true, snapshot(exec));
+            }
+
+            int reset = 0;
+            for (StepRun run : exec.getSteps().values()) {
+                if (run.getStatus() == StepStatus.FAILED || run.getStatus() == StepStatus.SKIPPED) {
+                    run.setStatus(StepStatus.PENDING);
+                    run.setStartedAt(0);
+                    run.setFinishedAt(0);
+                    run.setFailure(null);
+                    reset++;
+                }
+            }
+            exec.setStatus(WorkflowStatus.RUNNING);
+            exec.setFailure(null);
+            persist(exec);
+            log.info("[workflowId={}] 续跑受理：{} 个未成功步骤重置为 PENDING，SUCCESS 步骤保持不重跑",
+                    workflowId, reset);
+
+            startPump(workflowId);
+            return new SubmitOutcome(false, snapshot(exec));
+        }
+    }
+
     public Optional<WorkflowExecution> get(String workflowId) {
         WorkflowExecution exec = cache.get(workflowId);
         return exec == null ? Optional.empty() : Optional.of(snapshot(exec));
@@ -243,29 +294,70 @@ public class WorkflowEngine {
         if (run.getStatus() == StepStatus.SUCCESS) {
             return; // 防御：终态不覆盖
         }
-        run.setFinishedAt(System.currentTimeMillis());
+        long now = System.currentTimeMillis();
+        run.setFinishedAt(now);
+        recordAttemptResult(run, outcome, now);
         if (outcome.success()) {
             run.setStatus(StepStatus.SUCCESS);
             run.setFailure(null);
-            log.info("[workflowId={}] stepId={} 最终状态=SUCCESS",
-                    exec.getWorkflowId(), outcome.stepId());
+            log.info("[workflowId={}] stepId={} 最终状态=SUCCESS（第 {} 次尝试）",
+                    exec.getWorkflowId(), outcome.stepId(), run.getAttempts());
         } else {
+            StepDef step = DagValidator.indexById(exec.getDefinition()).get(outcome.stepId());
+            int maxAttempts = 1 + (step == null ? 0 : step.maxRetries());
+            if (run.getAttempts() < maxAttempts) {
+                // 重试次数未用尽：回到 PENDING 等待重试，不视为最终失败
+                run.setStatus(StepStatus.PENDING);
+                run.setFailure(null);
+                state.dispatched.remove(outcome.stepId());
+                long delay = step.retryDelayMs();
+                state.retryNotBefore.put(outcome.stepId(), now + delay);
+                persist(exec);
+                log.warn("[workflowId={}] stepId={} 第 {} 次尝试失败（{}），{}ms 后进行第 {} 次尝试",
+                        exec.getWorkflowId(), outcome.stepId(), run.getAttempts(),
+                        outcome.failureType(), delay, run.getAttempts() + 1);
+                return;
+            }
             run.setStatus(StepStatus.FAILED);
             run.setFailure(new FailureInfo(outcome.failureType(), outcome.stepId(), outcome.message()));
             state.failed = true;
-            log.warn("[workflowId={}] stepId={} 最终状态=FAILED/{} {}",
+            log.warn("[workflowId={}] stepId={} 最终状态=FAILED/{} {}（共 {} 次尝试，重试次数已用尽）",
                     exec.getWorkflowId(), outcome.stepId(),
-                    outcome.failureType(), outcome.message());
+                    outcome.failureType(), outcome.message(), run.getAttempts());
         }
         persist(exec);
     }
 
+    /** 把本次尝试的结果写入最近一次尝试记录（派发时已追加占位记录）。 */
+    private void recordAttemptResult(StepRun run, StepOutcome outcome, long finishedAt) {
+        com.github.h3yow.workflowdagenginejava.model.AttemptRecord record = null;
+        if (!run.getAttemptRecords().isEmpty()) {
+            record = run.getAttemptRecords().get(run.getAttemptRecords().size() - 1);
+        }
+        if (record == null || record.getFinishedAt() != 0) {
+            // 防御：没有对应的占位记录（例如老状态文件），补一条
+            record = new com.github.h3yow.workflowdagenginejava.model.AttemptRecord(
+                    run.getAttempts(), run.getStartedAt());
+            run.getAttemptRecords().add(record);
+        }
+        record.setFinishedAt(finishedAt);
+        record.setSuccess(outcome.success());
+        record.setFailureType(outcome.failureType());
+        record.setMessage(outcome.message());
+    }
+
     private void dispatchReady(WorkflowExecution exec, PumpState state) {
         Map<String, StepDef> byId = DagValidator.indexById(exec.getDefinition());
+        long now = System.currentTimeMillis();
         TreeSet<String> ready = new TreeSet<>();
         for (StepDef step : exec.getDefinition().steps()) {
             StepRun run = exec.getSteps().get(step.id());
             if (run.getStatus() != StepStatus.PENDING || state.dispatched.contains(step.id())) {
+                continue;
+            }
+            // 重试间隔未到：本次不派发，等下一拍
+            Long notBefore = state.retryNotBefore.get(step.id());
+            if (notBefore != null && now < notBefore) {
                 continue;
             }
             boolean depsOk = true;
@@ -295,14 +387,18 @@ public class WorkflowEngine {
             }
             StepDef step = byId.get(stepId);
             StepRun run = exec.getSteps().get(stepId);
-            long now = System.currentTimeMillis();
+            long startedAt = System.currentTimeMillis();
             run.setStatus(StepStatus.RUNNING);
-            run.setStartedAt(now);
+            run.setStartedAt(startedAt);
             run.setAttempts(run.getAttempts() + 1);
+            run.getAttemptRecords().add(
+                    new com.github.h3yow.workflowdagenginejava.model.AttemptRecord(
+                            run.getAttempts(), startedAt));
+            state.retryNotBefore.remove(stepId);
             persist(exec);
             state.dispatched.add(stepId);
-            log.info("[workflowId={}] stepId={} 派发执行，依赖={}",
-                    exec.getWorkflowId(), stepId, step.dependsOn());
+            log.info("[workflowId={}] stepId={} 派发执行（第 {} 次尝试），依赖={}",
+                    exec.getWorkflowId(), stepId, run.getAttempts(), step.dependsOn());
 
             StepTask task = new StepTask(exec.getWorkflowId(), step,
                     resolveTimeout(step), registry, stepSlots);
@@ -344,6 +440,7 @@ public class WorkflowEngine {
                 // 进程崩溃时正在执行的步骤没有可信的完成结果，回到 PENDING 重新执行
                 run.setStatus(StepStatus.PENDING);
                 run.setStartedAt(0);
+                markInterruptedAttempt(run);
                 reset++;
             }
         }
@@ -352,6 +449,22 @@ public class WorkflowEngine {
         log.info("[workflowId={}] 断点恢复：{} 个中断在 RUNNING 的步骤回到 PENDING，"
                         + "SUCCESS 步骤保持不重跑",
                 exec.getWorkflowId(), reset);
+    }
+
+    /**
+     * 崩溃时被中断的那次尝试没有结果：把占位记录补全为"中断"，
+     * 已累加的 attempts 保持不变（不重复累加、也不回退）。
+     */
+    private void markInterruptedAttempt(StepRun run) {
+        if (run.getAttemptRecords().isEmpty()) {
+            return;
+        }
+        var last = run.getAttemptRecords().get(run.getAttemptRecords().size() - 1);
+        if (last.getFinishedAt() == 0) {
+            last.setFinishedAt(System.currentTimeMillis());
+            last.setSuccess(false);
+            last.setMessage("服务重启，本次尝试被中断，步骤将重新执行");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -386,7 +499,7 @@ public class WorkflowEngine {
         return locks.computeIfAbsent(workflowId, k -> new Object());
     }
 
-    /** 幂等键冲突判定：按 (id,type,deps,param,timeoutMs) 做语义比较，忽略步骤数组顺序。 */
+    /** 幂等键冲突判定：按 (id,type,deps,param,timeoutMs,重试配置) 做语义比较，忽略步骤数组顺序。 */
     private boolean sameDefinition(WorkflowDef a, WorkflowDef b) {
         if (a == b) {
             return true;
@@ -408,6 +521,8 @@ public class WorkflowEngine {
             if (!java.util.Objects.equals(x.type(), y.type())
                     || !java.util.Objects.equals(x.param(), y.param())
                     || x.timeoutMs() != y.timeoutMs()
+                    || x.maxRetries() != y.maxRetries()
+                    || x.retryDelayMs() != y.retryDelayMs()
                     || !new TreeSet<>(x.dependsOn()).equals(new TreeSet<>(y.dependsOn()))) {
                 return false;
             }
@@ -518,6 +633,8 @@ public class WorkflowEngine {
     private static final class PumpState {
         final Map<String, Future<StepOutcome>> inflight = new java.util.HashMap<>();
         final java.util.Set<String> dispatched = new java.util.HashSet<>();
+        /** 步骤级重试冷却：未到时间戳不重新派发。 */
+        final Map<String, Long> retryNotBefore = new java.util.HashMap<>();
         volatile boolean failed = false;
     }
 }
