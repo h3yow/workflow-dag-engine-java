@@ -33,6 +33,16 @@ public class WorkflowController {
         return new SubmitResponse(outcome.deduplicated(), outcome.execution());
     }
 
+    /**
+     * 失败续跑：只重新执行未成功的步骤。接口异步，立即返回当前状态；
+     * 并发重复续跑只有第一次生效，其余请求拿到的是同一份执行（deduplicated=true）。
+     */
+    @PostMapping("/{workflowId}/resume")
+    public SubmitResponse resume(@PathVariable String workflowId) {
+        SubmitOutcome outcome = engine.resume(workflowId);
+        return new SubmitResponse(outcome.deduplicated(), outcome.execution());
+    }
+
     @GetMapping("/{workflowId}")
     public ResponseEntity<WorkflowExecution> get(@PathVariable String workflowId) {
         return engine.get(workflowId)

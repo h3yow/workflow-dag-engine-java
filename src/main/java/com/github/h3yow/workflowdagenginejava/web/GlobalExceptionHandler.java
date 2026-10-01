@@ -1,6 +1,7 @@
 package com.github.h3yow.workflowdagenginejava.web;
 
 import com.github.h3yow.workflowdagenginejava.engine.DuplicateWorkflowException;
+import com.github.h3yow.workflowdagenginejava.engine.WorkflowNotFoundException;
 import com.github.h3yow.workflowdagenginejava.validation.InvalidWorkflowException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -24,5 +25,11 @@ public class GlobalExceptionHandler {
     public ResponseEntity<RejectResponse> handleDuplicate(DuplicateWorkflowException ex) {
         RejectResponse body = new RejectResponse(null, "DEFINITION_CONFLICT", ex.getMessage());
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    @ExceptionHandler(WorkflowNotFoundException.class)
+    public ResponseEntity<RejectResponse> handleNotFound(WorkflowNotFoundException ex) {
+        RejectResponse body = new RejectResponse(null, "WORKFLOW_NOT_FOUND", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
     }
 }

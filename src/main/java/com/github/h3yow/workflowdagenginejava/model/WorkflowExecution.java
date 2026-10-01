@@ -14,6 +14,8 @@ public class WorkflowExecution {
     private FailureInfo failure;
     private long createdAt;
     private long updatedAt;
+    /** 失败后续跑（resume）的次数：首次执行为 0，每次续跑 +1，会被持久化用于重启后判断批次。 */
+    private int resumeCount;
 
     public WorkflowExecution() {
     }
@@ -72,5 +74,13 @@ public class WorkflowExecution {
 
     public void setUpdatedAt(long updatedAt) {
         this.updatedAt = updatedAt;
+    }
+
+    public int getResumeCount() {
+        return resumeCount;
+    }
+
+    public void setResumeCount(int resumeCount) {
+        this.resumeCount = resumeCount;
     }
 }

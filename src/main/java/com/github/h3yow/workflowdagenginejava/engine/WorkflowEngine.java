@@ -2,6 +2,8 @@ package com.github.h3yow.workflowdagenginejava.engine;
 
 import com.github.h3yow.workflowdagenginejava.model.FailureInfo;
 import com.github.h3yow.workflowdagenginejava.model.FailureType;
+import com.github.h3yow.workflowdagenginejava.model.AttemptResult;
+import com.github.h3yow.workflowdagenginejava.model.StepAttempt;
 import com.github.h3yow.workflowdagenginejava.model.StepDef;
 import com.github.h3yow.workflowdagenginejava.model.RejectReason;
 import com.github.h3yow.workflowdagenginejava.model.StepRun;
@@ -54,6 +56,9 @@ public class WorkflowEngine {
     private final ConcurrentHashMap<String, WorkflowExecution> cache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, PumpState> pumps = new ConcurrentHashMap<>();
+    /** 正在进行的续跑：同一工作流并发重复续跑时，后来者等待同一个结果，续跑只真正执行一次。 */
+    private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<WorkflowExecution>>
+            resumeWaiters = new ConcurrentHashMap<>();
 
     private ExecutorService stepPool;
     private ScheduledExecutorService pumpPool;
@@ -89,6 +94,20 @@ public class WorkflowEngine {
         }
         if (stepPool != null) {
             stepPool.shutdownNow();
+        }
+    }
+
+    /**
+     * 测试/演练用：模拟进程被突然杀死（kill -9）——立即关闭调度泵，且不等待、不中断步骤线程，
+     * 使正在执行的步骤停留在 RUNNING、最后一次尝试停留在"已开始未结束"状态。
+     */
+    public void crash() {
+        if (pumpPool != null) {
+            pumpPool.shutdownNow();
+        }
+        if (stepPool != null) {
+            // 故意只 shutdown 不 shutdownNow：不向步骤线程发中断，模拟进程瞬间消失
+            stepPool.shutdown();
         }
     }
 
@@ -154,12 +173,98 @@ public class WorkflowEngine {
         return cache.values().stream().map(this::snapshot).toList();
     }
 
+    /**
+     * 失败工作流续跑：只重新执行未成功的部分。
+     *
+     * <ul>
+     *   <li>已 {@code SUCCESS} 的步骤保持终态，绝不重跑，历史尝试记录原样保留；</li>
+     *   <li>{@code FAILED} 与 {@code SKIPPED} 步骤回到 {@code PENDING}，按原依赖关系补跑，
+     *       只有其依赖都成功后才会被派发；</li>
+     *   <li>新发起的尝试追加在既有 attemptRecords 之后，attempts 连续累计、不重复累加；</li>
+     *   <li>续跑状态立即落盘，跑到一半服务重启，恢复逻辑会继续把它跑完。</li>
+     * </ul>
+     *
+     * <p>幂等：同一工作流并发重复续跑只有第一次真正生效，其余请求阻塞等待并拿到同一份终态结果；
+     * 工作流已 SUCCESS 时续跑与重复提交行为一致——直接返回既有执行（{@code deduplicated=true}），
+     * 不产生第二次执行；工作流仍在 RUNNING（含上一次续跑尚未结束）时同样返回当前执行而不重复触发。</p>
+     *
+     * @throws WorkflowNotFoundException 工作流不存在
+     */
+    public SubmitOutcome resume(String workflowId) {
+        ensurePools();
+        Object lock = lockFor(workflowId);
+        java.util.concurrent.CompletableFuture<WorkflowExecution> toAwait = null;
+        boolean deduplicated = false;
+        synchronized (lock) {
+            WorkflowExecution exec = cache.get(workflowId);
+            if (exec == null) {
+                throw new WorkflowNotFoundException(workflowId);
+            }
+            if (exec.getStatus() == WorkflowStatus.SUCCESS) {
+                // 已成功：与重复提交行为完全一致，返回既有执行，不产生第二次执行
+                log.info("[workflowId={}] 对已成功工作流续跑，直接返回既有执行", workflowId);
+                return new SubmitOutcome(true, snapshot(exec));
+            }
+            if (exec.getStatus() == WorkflowStatus.RUNNING) {
+                java.util.concurrent.CompletableFuture<WorkflowExecution> inflight =
+                        resumeWaiters.get(workflowId);
+                if (inflight != null) {
+                    // 另一次续跑正在进行：本次请求不触发执行，等待同一份终态结果
+                    toAwait = inflight;
+                    deduplicated = true;
+                } else {
+                    // 首次执行仍在进行：不重复触发，返回当前状态
+                    log.info("[workflowId={}] 工作流仍在首次执行，续跑请求不产生新执行", workflowId);
+                    return new SubmitOutcome(true, snapshot(exec));
+                }
+            } else {
+                // FAILED：重置未成功部分，发起一次新批次
+                int reset = 0;
+                for (StepRun run : exec.getSteps().values()) {
+                    if (run.getStatus() != StepStatus.SUCCESS) {
+                        run.setStatus(StepStatus.PENDING);
+                        run.setStartedAt(0);
+                        run.setFinishedAt(0);
+                        run.setFailure(null);
+                        reset++;
+                    }
+                    // SUCCESS 步骤：状态、结果、attemptRecords/attempts 全部原样保留，绝不重跑
+                }
+                exec.setFailure(null);
+                exec.setStatus(WorkflowStatus.RUNNING);
+                exec.setResumeCount(exec.getResumeCount() + 1);
+                persist(exec);
+                log.info("[workflowId={}] 失败续跑开始（第 {} 批次）：SUCCESS 步骤保持不重跑，"
+                                + "{} 个未成功步骤回到 PENDING",
+                        workflowId, exec.getResumeCount(), reset);
+
+                java.util.concurrent.CompletableFuture<WorkflowExecution> waiter =
+                        new java.util.concurrent.CompletableFuture<>();
+                resumeWaiters.put(workflowId, waiter);
+                startPump(workflowId);
+                toAwait = waiter;
+            }
+        }
+
+        // 锁外等待本次执行到达终态：发起方与并发后来者拿到的是同一份结果
+        try {
+            return new SubmitOutcome(deduplicated, toAwait.get());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("等待续跑结果被中断", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw new IllegalStateException("续跑等待异常", e.getCause());
+        }
+    }
+
     // ------------------------------------------------------------------
     // 调度泵
     // ------------------------------------------------------------------
 
     private void startPump(String workflowId) {
-        PumpState state = new PumpState();
+        WorkflowExecution exec = cache.get(workflowId);
+        int runNo = exec == null ? 1 : exec.getResumeCount() + 1;
+        PumpState state = new PumpState(runNo);
         pumps.put(workflowId, state);
         pumpPool.schedule(() -> pumpOnce(workflowId, state), 0, TimeUnit.MILLISECONDS);
     }
@@ -183,6 +288,7 @@ public class WorkflowEngine {
             pumpPool.schedule(() -> pumpOnce(workflowId, state), 5, TimeUnit.MILLISECONDS);
         } else {
             pumps.remove(workflowId);
+            completeResumeWaiter(workflowId);
         }
     }
 
@@ -298,14 +404,13 @@ public class WorkflowEngine {
             long now = System.currentTimeMillis();
             run.setStatus(StepStatus.RUNNING);
             run.setStartedAt(now);
-            run.setAttempts(run.getAttempts() + 1);
             persist(exec);
             state.dispatched.add(stepId);
-            log.info("[workflowId={}] stepId={} 派发执行，依赖={}",
-                    exec.getWorkflowId(), stepId, step.dependsOn());
+            log.info("[workflowId={}] stepId={} 派发执行（第 {} 批次），依赖={}",
+                    exec.getWorkflowId(), stepId, state.runNo, step.dependsOn());
 
             StepTask task = new StepTask(exec.getWorkflowId(), step,
-                    resolveTimeout(step), registry, stepSlots);
+                    resolveTimeout(step), registry, stepSlots, state.attemptListener(exec));
             Future<StepOutcome> future = stepPool.submit(task);
             state.inflight.put(stepId, future);
             dispatched++;
@@ -341,7 +446,19 @@ public class WorkflowEngine {
         int reset = 0;
         for (StepRun run : exec.getSteps().values()) {
             if (run.getStatus() == StepStatus.RUNNING) {
-                // 进程崩溃时正在执行的步骤没有可信的完成结果，回到 PENDING 重新执行
+                // 进程崩溃时正在执行的步骤没有可信的完成结果，回到 PENDING 重新执行。
+                // 已落盘但未结束的最后一次尝试补记为 INTERRUPTED，如实保留耗时与次数；
+                // attempts 以已记录的尝试明细为准对齐，恢复后重派只再累加 1，不会重复计数。
+                List<StepAttempt> records = run.getAttemptRecords();
+                for (int i = 0; i < records.size(); i++) {
+                    StepAttempt a = records.get(i);
+                    if (a.result() == null) {
+                        records.set(i, new StepAttempt(a.stepId(), a.attemptNo(), a.runNo(),
+                                a.startedAt(), System.currentTimeMillis(),
+                                AttemptResult.INTERRUPTED, "进程重启，尝试中断，无可信结果"));
+                    }
+                }
+                run.setAttempts(records.size());
                 run.setStatus(StepStatus.PENDING);
                 run.setStartedAt(0);
                 reset++;
@@ -382,6 +499,27 @@ public class WorkflowEngine {
         store.save(exec);
     }
 
+    /** 用结束明细替换同序号的"开始中"尝试记录。 */
+    private static void replaceLastAttempt(StepRun run, StepAttempt finished) {
+        List<StepAttempt> records = run.getAttemptRecords();
+        for (int i = records.size() - 1; i >= 0; i--) {
+            if (records.get(i).attemptNo() == finished.attemptNo()) {
+                records.set(i, finished);
+                return;
+            }
+        }
+        records.add(finished);
+    }
+
+    /** 工作流到达终态时唤醒所有等待续跑结果的请求，返回与执行方同一份快照。 */
+    private void completeResumeWaiter(String workflowId) {
+        java.util.concurrent.CompletableFuture<WorkflowExecution> waiter =
+                resumeWaiters.remove(workflowId);
+        if (waiter != null) {
+            waiter.complete(snapshot(cache.get(workflowId)));
+        }
+    }
+
     private Object lockFor(String workflowId) {
         return locks.computeIfAbsent(workflowId, k -> new Object());
     }
@@ -408,6 +546,8 @@ public class WorkflowEngine {
             if (!java.util.Objects.equals(x.type(), y.type())
                     || !java.util.Objects.equals(x.param(), y.param())
                     || x.timeoutMs() != y.timeoutMs()
+                    || x.maxRetries() != y.maxRetries()
+                    || x.retryBackoffMs() != y.retryBackoffMs()
                     || !new TreeSet<>(x.dependsOn()).equals(new TreeSet<>(y.dependsOn()))) {
                 return false;
             }
@@ -438,36 +578,105 @@ public class WorkflowEngine {
         }
     }
 
-    /** 带超时控制的步骤任务；执行结束（含异常/超时）后释放并发槽位。 */
+    /**
+     * 带超时控制与自动重试的步骤任务；总尝试次数 = 1 + maxRetries。
+     *
+     * <p>所有尝试（含两次尝试之间的退避等待）都在同一次槽位占用内完成，槽位在 {@link #call()}
+     * 的 finally 中只释放一次，因此重试再多也不会突破全局并发上限。</p>
+     */
     private static final class StepTask implements java.util.concurrent.Callable<StepOutcome> {
         private final String workflowId;
         private final StepDef step;
         private final long timeoutMs;
+        private final int maxRetries;
+        private final long retryBackoffMs;
         private final StepHandlerRegistry registry;
         private final java.util.concurrent.Semaphore slots;
+        private final AttemptListener listener;
 
         StepTask(String workflowId, StepDef step, long timeoutMs, StepHandlerRegistry registry,
-                 java.util.concurrent.Semaphore slots) {
+                 java.util.concurrent.Semaphore slots, AttemptListener listener) {
             this.workflowId = workflowId;
             this.step = step;
             this.timeoutMs = timeoutMs;
+            this.maxRetries = step.maxRetries();
+            this.retryBackoffMs = step.retryBackoffMs();
             this.registry = registry;
             this.slots = slots;
+            this.listener = listener;
         }
 
         @Override
         public StepOutcome call() {
             try {
-                return doCall();
+                StepOutcome last = null;
+                for (int attemptIndex = 0; attemptIndex <= maxRetries; attemptIndex++) {
+                    long startedAt = System.currentTimeMillis();
+                    StepAttempt attempt = listener.onAttemptStart(step.id(), startedAt);
+
+                    AttemptResult result;
+                    String message = null;
+                    long finishedAt;
+                    try {
+                        message = invokeOnce();
+                        result = AttemptResult.SUCCESS;
+                    } catch (AttemptFailure f) {
+                        result = f.result();
+                        message = f.getMessage();
+                    }
+                    finishedAt = System.currentTimeMillis();
+                    listener.onAttemptFinish(attempt, result, message, finishedAt);
+
+                    if (result == AttemptResult.SUCCESS) {
+                        return StepOutcome.ok(step.id());
+                    }
+                    last = StepOutcome.failure(step.id(), mapFailureType(result), message);
+
+                    // 定义层错误不重试；次数用尽则按最后一次原因终态失败
+                    if (result == AttemptResult.DEFINITION_ERROR || attemptIndex == maxRetries) {
+                        return last;
+                    }
+                    log.info("[workflowId={}] stepId={} 第 {} 次尝试失败/{}，{}ms 后自动重试（剩余 {} 次）",
+                            workflowId, step.id(), attempt.attemptNo(), result,
+                            retryBackoffMs, maxRetries - attemptIndex);
+                    if (!backoff()) {
+                        // 退避期间被中断（如进程关闭）：本次尝试失败原因已如实落盘，交由恢复逻辑处理
+                        Thread.currentThread().interrupt();
+                        return last;
+                    }
+                }
+                return last;
             } finally {
                 slots.release();
             }
         }
 
-        private StepOutcome doCall() {
+        /** 退避等待，仍占用并发槽位；响应中断。 */
+        private boolean backoff() {
+            if (retryBackoffMs <= 0) {
+                return true;
+            }
+            try {
+                Thread.sleep(retryBackoffMs);
+                return true;
+            } catch (InterruptedException e) {
+                return false;
+            }
+        }
+
+        private static FailureType mapFailureType(AttemptResult result) {
+            return switch (result) {
+                case TIMEOUT -> FailureType.TIMEOUT;
+                case DEFINITION_ERROR -> FailureType.DEFINITION_ERROR;
+                default -> FailureType.STEP_EXCEPTION;
+            };
+        }
+
+        /** 执行一次处理器并施加单次尝试超时；成功返回 null，失败抛出带分类的 AttemptFailure。 */
+        private String invokeOnce() {
             StepHandler handler = registry.find(step.type()).orElse(null);
             if (handler == null) {
-                return StepOutcome.failure(step.id(), FailureType.DEFINITION_ERROR,
+                throw new AttemptFailure(AttemptResult.DEFINITION_ERROR,
                         "步骤类型不受支持: " + step.type());
             }
             ExecutorService oneShot = Executors.newSingleThreadExecutor(r -> {
@@ -485,25 +694,39 @@ public class WorkflowEngine {
                 });
                 try {
                     f.get(timeoutMs, TimeUnit.MILLISECONDS);
-                    return StepOutcome.ok(step.id());
+                    return null;
                 } catch (TimeoutException e) {
                     f.cancel(true);
-                    return StepOutcome.failure(step.id(), FailureType.TIMEOUT,
+                    throw new AttemptFailure(AttemptResult.TIMEOUT,
                             "步骤执行超过超时时间 " + timeoutMs + "ms");
                 } catch (ExecutionException e) {
                     Throwable cause = e.getCause();
                     if (cause instanceof StepExecutionException see && see.getCause() != null) {
                         cause = see.getCause();
                     }
-                    return StepOutcome.failure(step.id(), FailureType.STEP_EXCEPTION,
+                    throw new AttemptFailure(AttemptResult.STEP_EXCEPTION,
                             cause.getClass().getSimpleName() + ": " + cause.getMessage());
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    return StepOutcome.failure(step.id(), FailureType.STEP_EXCEPTION, "调度被中断");
+                    throw new AttemptFailure(AttemptResult.STEP_EXCEPTION, "调度被中断");
                 }
             } finally {
                 oneShot.shutdownNow();
             }
+        }
+    }
+
+    /** 单次尝试失败：携带可区分的结果分类。 */
+    private static final class AttemptFailure extends RuntimeException {
+        private final AttemptResult result;
+
+        AttemptFailure(AttemptResult result, String message) {
+            super(message);
+            this.result = result;
+        }
+
+        AttemptResult result() {
+            return result;
         }
     }
 
@@ -515,9 +738,51 @@ public class WorkflowEngine {
     }
 
     /** 每个工作流调度泵的可变状态。 */
-    private static final class PumpState {
+    private final class PumpState {
         final Map<String, Future<StepOutcome>> inflight = new java.util.HashMap<>();
         final java.util.Set<String> dispatched = new java.util.HashSet<>();
         volatile boolean failed = false;
+        /** 当前执行批次：首次执行=1，每次续跑 +1，记录在每条尝试明细上。 */
+        final int runNo;
+
+        PumpState(int runNo) {
+            this.runNo = runNo;
+        }
+
+        /**
+         * 构建本批次的尝试监听器：回调在步骤执行线程触发，通过工作流锁串行化对状态的修改，
+         * 每次尝试开始/结束都立即落盘，因此崩溃后最多丢失"已开始但未记录"的一次尝试，且不会重复累计。
+         */
+        AttemptListener attemptListener(WorkflowExecution exec) {
+            return new AttemptListener() {
+                @Override
+                public StepAttempt onAttemptStart(String stepId, long startedAt) {
+                    Object lock = lockFor(exec.getWorkflowId());
+                    synchronized (lock) {
+                        StepRun run = exec.getSteps().get(stepId);
+                        int attemptNo = run.getAttempts() + 1;
+                        StepAttempt attempt = new StepAttempt(
+                                stepId, attemptNo, runNo, startedAt, 0L, null, null);
+                        run.setAttempts(attemptNo);
+                        run.getAttemptRecords().add(attempt);
+                        persist(exec);
+                        return attempt;
+                    }
+                }
+
+                @Override
+                public void onAttemptFinish(StepAttempt attempt, AttemptResult result,
+                                            String message, long finishedAt) {
+                    Object lock = lockFor(exec.getWorkflowId());
+                    synchronized (lock) {
+                        StepRun run = exec.getSteps().get(attempt.stepId());
+                        replaceLastAttempt(run, new StepAttempt(
+                                attempt.stepId(), attempt.attemptNo(), attempt.runNo(),
+                                attempt.startedAt(), finishedAt, result, message));
+                        persist(exec);
+                    }
+                }
+            };
+        }
     }
 }

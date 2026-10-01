@@ -28,6 +28,11 @@ final class TestSupport {
         return new StepDef(id, type, List.of(deps), param, timeoutMs);
     }
 
+    static StepDef retryStep(String id, String type, String param, long timeoutMs,
+                             int maxRetries, long retryBackoffMs, String... deps) {
+        return new StepDef(id, type, List.of(deps), param, timeoutMs, maxRetries, retryBackoffMs);
+    }
+
     static StepDef noop(String id, String... deps) {
         return step(id, "noop", null, 0L, deps);
     }
