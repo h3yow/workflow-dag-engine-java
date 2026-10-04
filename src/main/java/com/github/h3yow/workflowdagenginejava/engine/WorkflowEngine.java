@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -54,6 +55,10 @@ public class WorkflowEngine {
     private final ConcurrentHashMap<String, WorkflowExecution> cache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, PumpState> pumps = new ConcurrentHashMap<>();
+    /** 每个执行批次（首次执行/一次续跑/重启恢复）的完成句柄：批次到达终态时以终态快照完成。 */
+    private final ConcurrentHashMap<String, CompletableFuture<WorkflowExecution>>
+            batchCompletions = new ConcurrentHashMap<>();
+    private volatile boolean running = true;
 
     private ExecutorService stepPool;
     private ScheduledExecutorService pumpPool;
@@ -76,6 +81,7 @@ public class WorkflowEngine {
         for (WorkflowExecution exec : loaded) {
             cache.put(exec.getWorkflowId(), exec);
             if (exec.getStatus() == WorkflowStatus.RUNNING) {
+                batchCompletions.put(exec.getWorkflowId(), new CompletableFuture<>());
                 recoverRunning(exec);
                 startPump(exec.getWorkflowId());
             }
@@ -84,8 +90,21 @@ public class WorkflowEngine {
 
     @PreDestroy
     public void shutdown() {
+        running = false;
+        // 释放仍在等待批次结果的续跑请求，由它们退化为读取当前状态
+        batchCompletions.forEach((id, future) -> future.completeExceptionally(
+                new IllegalStateException("引擎已关闭，批次未完成")));
+        batchCompletions.clear();
+        // 先停调度泵并等其退出：此后再中断步骤线程池，
+        // 被中断步骤产生的"调度被中断"结果不会再被泵回收落盘，
+        // 磁盘上保持 RUNNING，下次启动按断点恢复规则重跑——与进程崩溃的语义一致
         if (pumpPool != null) {
             pumpPool.shutdownNow();
+            try {
+                pumpPool.awaitTermination(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         if (stepPool != null) {
             stepPool.shutdownNow();
@@ -138,6 +157,7 @@ public class WorkflowEngine {
             }
             persist(exec);
             cache.put(def.workflowId(), exec);
+            batchCompletions.put(def.workflowId(), new CompletableFuture<>());
             log.info("[workflowId={}] 新工作流已接收，步骤数={}", def.workflowId(), def.steps().size());
 
             startPump(def.workflowId());
@@ -149,9 +169,11 @@ public class WorkflowEngine {
      * 失败工作流续跑（幂等）：
      * <ul>
      *   <li>FAILED：把 FAILED/SKIPPED 步骤重置为 PENDING 后重新调度；
-     *       已 SUCCESS 的步骤原样保留、绝不重跑，已记录的尝试次数与尝试记录保留不累加；</li>
-     *   <li>RUNNING：说明已有首次执行或另一次续跑正在进行，返回既有执行（deduplicated=true），
-     *       并发重复触发只生效一次；</li>
+     *       已 SUCCESS 的步骤原样保留、绝不重跑，已记录的尝试次数与尝试记录保留不累加；
+     *       被重置的步骤把重试预算基线推到当前 attempts，本轮重新获得定义里配置的全部重试次数；</li>
+     *   <li>RUNNING：说明已有首次执行或另一次续跑正在进行，不重复触发；
+     *       请求会等待该批次跑完，返回与真正触发者同一次执行的终态结果（deduplicated=true），
+     *       而不是执行中的半截快照；</li>
      *   <li>SUCCESS：没有需要补跑的部分，返回既有执行（deduplicated=true）；</li>
      *   <li>workflowId 不存在：抛出 {@link WorkflowNotFoundException}（HTTP 404）。</li>
      * </ul>
@@ -161,38 +183,87 @@ public class WorkflowEngine {
     public SubmitOutcome resume(String workflowId) {
         ensurePools();
         Object lock = lockFor(workflowId);
+        CompletableFuture<WorkflowExecution> pendingBatch = null;
         synchronized (lock) {
             WorkflowExecution exec = cache.get(workflowId);
             if (exec == null) {
                 throw new WorkflowNotFoundException("workflowId=" + workflowId + " 不存在");
             }
             if (exec.getStatus() == WorkflowStatus.RUNNING) {
-                log.info("[workflowId={}] 续跑幂等命中：工作流正在执行中，返回既有执行", workflowId);
-                return new SubmitOutcome(true, snapshot(exec));
-            }
-            if (exec.getStatus() == WorkflowStatus.SUCCESS) {
+                // 并发/重复续跑：只生效一次，其余请求等这一批跑完后拿同一份终态结果
+                pendingBatch = batchCompletions.get(workflowId);
+                log.info("[workflowId={}] 续跑幂等命中：已有批次在执行，等待其结束后返回一致结果",
+                        workflowId);
+            } else if (exec.getStatus() == WorkflowStatus.SUCCESS) {
                 log.info("[workflowId={}] 续跑幂等命中：工作流已成功结束，无需补跑", workflowId);
                 return new SubmitOutcome(true, snapshot(exec));
-            }
+            } else {
+                int reset = 0;
+                for (StepRun run : exec.getSteps().values()) {
+                    if (run.getStatus() == StepStatus.FAILED || run.getStatus() == StepStatus.SKIPPED) {
+                        run.setStatus(StepStatus.PENDING);
+                        run.setStartedAt(0);
+                        run.setFinishedAt(0);
+                        run.setFailure(null);
+                        // 新续跑批次从当前 attempts 起算：本批次重新获得定义里配置的全部重试次数，
+                        // 历史 attempts 与 attemptRecords 原样保留
+                        run.setBatchBaseAttempts(run.getAttempts());
+                        reset++;
+                    }
+                }
+                exec.setStatus(WorkflowStatus.RUNNING);
+                exec.setFailure(null);
+                persist(exec);
+                batchCompletions.put(workflowId, new CompletableFuture<>());
+                log.info("[workflowId={}] 续跑受理：{} 个未成功步骤重置为 PENDING，"
+                                + "SUCCESS 步骤保持不重跑，重试预算按定义重新计算",
+                        workflowId, reset);
 
-            int reset = 0;
-            for (StepRun run : exec.getSteps().values()) {
-                if (run.getStatus() == StepStatus.FAILED || run.getStatus() == StepStatus.SKIPPED) {
-                    run.setStatus(StepStatus.PENDING);
-                    run.setStartedAt(0);
-                    run.setFinishedAt(0);
-                    run.setFailure(null);
-                    reset++;
+                startPump(workflowId);
+                return new SubmitOutcome(false, snapshot(exec));
+            }
+        }
+        // 在工作流锁之外等待，避免挡住调度泵推进这一批次
+        WorkflowExecution done = awaitBatchTerminal(workflowId, pendingBatch);
+        log.info("[workflowId={}] 续跑幂等命中返回：跟随的批次已结束，状态={}",
+                workflowId, done.getStatus());
+        return new SubmitOutcome(true, done);
+    }
+
+    /**
+     * 等待当前执行批次到达终态并返回其快照。
+     * 有完成句柄时以句柄为准；没有（防御性兜底）则轮询缓存到终态。
+     */
+    private WorkflowExecution awaitBatchTerminal(
+            String workflowId, CompletableFuture<WorkflowExecution> pendingBatch) {
+        while (true) {
+            if (pendingBatch != null) {
+                try {
+                    return pendingBatch.get(50, TimeUnit.MILLISECONDS);
+                } catch (TimeoutException e) {
+                    // 批次尚未结束，继续等
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    pendingBatch = null;
+                } catch (ExecutionException e) {
+                    // 引擎关闭等异常：退化为轮询，返回当前能拿到的状态
+                    pendingBatch = null;
+                }
+            } else {
+                WorkflowExecution exec = cache.get(workflowId);
+                if (exec == null || exec.getStatus() != WorkflowStatus.RUNNING || !running) {
+                    if (exec == null) {
+                        throw new WorkflowNotFoundException("workflowId=" + workflowId + " 不存在");
+                    }
+                    return snapshot(exec);
+                }
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return snapshot(exec);
                 }
             }
-            exec.setStatus(WorkflowStatus.RUNNING);
-            exec.setFailure(null);
-            persist(exec);
-            log.info("[workflowId={}] 续跑受理：{} 个未成功步骤重置为 PENDING，SUCCESS 步骤保持不重跑",
-                    workflowId, reset);
-
-            startPump(workflowId);
-            return new SubmitOutcome(false, snapshot(exec));
         }
     }
 
@@ -305,7 +376,9 @@ public class WorkflowEngine {
         } else {
             StepDef step = DagValidator.indexById(exec.getDefinition()).get(outcome.stepId());
             int maxAttempts = 1 + (step == null ? 0 : step.maxRetries());
-            if (run.getAttempts() < maxAttempts) {
+            // 重试预算按执行批次计算：续跑批次重新获得定义里配置的全部重试次数
+            int batchUsed = run.getAttempts() - run.getBatchBaseAttempts();
+            if (batchUsed < maxAttempts) {
                 // 重试次数未用尽：回到 PENDING 等待重试，不视为最终失败
                 run.setStatus(StepStatus.PENDING);
                 run.setFailure(null);
@@ -424,6 +497,12 @@ public class WorkflowEngine {
             exec.setFailure(root);
         }
         persist(exec);
+        // 本批次到达终态：唤醒所有跟随等待的续跑请求，给它们同一份终态快照
+        CompletableFuture<WorkflowExecution> batch =
+                batchCompletions.remove(exec.getWorkflowId());
+        if (batch != null) {
+            batch.complete(snapshot(exec));
+        }
         log.info("[workflowId={}] 工作流结束，最终状态={}{}",
                 exec.getWorkflowId(), workflowStatus,
                 skipped > 0 ? "，跳过步骤数=" + skipped : "");
