@@ -7,6 +7,10 @@ import java.util.List;
  * 单个步骤的执行进度与溯源记录，会被持久化。
  * startedAt/finishedAt 为 epoch 毫秒，0 表示尚未发生。
  * attempts 为已派发的尝试次数（含自动重试），attemptRecords 记录每次尝试的起止与结果。
+ * roundBaseAttempts 为当前执行轮次（首次执行或一次续跑）开始时的 attempts 基线：
+ * 本轮已派发次数 = attempts - roundBaseAttempts，续跑时把基线抬到当时的 attempts，
+ * 使每一轮都重新获得定义里配置的重试次数，同时历史尝试次数与记录原样保留。
+ * 老版本状态文件没有该字段，反序列化为 0，行为与引入该字段之前完全一致。
  */
 public class StepRun {
     private String stepId;
@@ -14,6 +18,7 @@ public class StepRun {
     private long startedAt;
     private long finishedAt;
     private int attempts;
+    private int roundBaseAttempts;
     private FailureInfo failure;
     private List<AttemptRecord> attemptRecords = new ArrayList<>();
 
@@ -63,6 +68,14 @@ public class StepRun {
 
     public void setAttempts(int attempts) {
         this.attempts = attempts;
+    }
+
+    public int getRoundBaseAttempts() {
+        return roundBaseAttempts;
+    }
+
+    public void setRoundBaseAttempts(int roundBaseAttempts) {
+        this.roundBaseAttempts = roundBaseAttempts;
     }
 
     public FailureInfo getFailure() {

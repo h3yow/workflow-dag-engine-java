@@ -83,10 +83,15 @@
   历史每次尝试的分类可在 `attemptRecords` 中逐条查看。
 - 重试等待期间服务重启：步骤以 `PENDING` 落盘，恢复后按既有规则重新派发，
   已累加的 `attempts` 不回退、不重复累加。
+- **重试预算按"执行轮次"计算**：首次执行是一轮，每一次续跑是新的一轮。
+  每轮各自拥有完整的 `1 + maxRetries` 次尝试预算（见第 5 节）；
+  `attempts` 与 `attemptRecords` 是跨轮累计的历史，只增不减。
 
 **兼容性**：未配置重试的老定义（`maxRetries=0`）行为与引入重试之前完全一致——
-失败一次即终态（有专门用例 `RetryTest.definitionWithoutRetryKeepsLegacyBehavior` 守护）；
-老版本落盘的状态文件不含重试字段与尝试记录，反序列化后按缺省值处理，可直接加载。
+失败一次即终态（有专门用例 `RetryTest.definitionWithoutRetryKeepsLegacyBehavior` 守护），
+续跑老定义时也只是原样补跑一次，不会凭空多出重试；
+老版本落盘的状态文件不含重试字段、尝试记录与轮次基线，反序列化后按缺省值处理
+（基线为 0，即"本轮 = 全部历史"），可直接加载，语义与旧版本一致。
 
 ## 5. 失败工作流续跑
 
@@ -96,16 +101,25 @@
 - 已 `SUCCESS` 的步骤原样保留、绝不重跑，其 `attempts` 与 `attemptRecords` 不动；
 - `FAILED` 与被级联 `SKIPPED` 的步骤重置为 `PENDING`，按依赖关系重新调度
   （上游已成功的直接复用结果，被跳过的步骤这次会补跑）；
-- 重置与状态落盘在同一把锁内完成，续跑期间服务重启按第 6 节断点恢复规则继续，
-  已成功的不重跑、已记录的尝试次数不重复累加；
+- **续跑批次里的自动重试**：每个被重置的步骤把"本轮重试基线"（`roundBaseAttempts`，
+  随状态落盘）抬到当时的 `attempts`，本轮重新获得定义里配置的全部
+  `1 + maxRetries` 次尝试——续跑里第一次失败不会直接终态，而是和正常执行一样
+  先按配置重试；只有本轮次数也用尽才置为 `FAILED` 并停掉后续步骤，
+  重试到成功或重试耗尽后失败的表现与首次执行完全一致。
+  历史 `attempts`/`attemptRecords` 跨轮累计保留，不回退、不重复累加；
+- 续跑里的重试与首次执行走同一条派发路径，**同样受全局并发上限约束**；
+- 重置与状态落盘在同一把锁内完成，续跑期间服务重启按第 6 节断点恢复规则继续：
+  已成功的不重跑、已记录的尝试次数不重复累加，本轮剩余重试预算随
+  `roundBaseAttempts` 落盘而保留，重启后依然有效；
 - 续跑结束后的整体状态与每步结果通过 `GET /api/workflows/{workflowId}` 正常查询，
   与首次执行的呈现完全一致。
 
 **幂等语义**：
 
-- 并发/重复触发续跑：只有一个请求真正受理（`deduplicated=false`），
-  其余请求在续跑进行中或已成功结束时命中幂等，返回**同一份执行**
-  （`deduplicated=true`），不会各跑一遍；
+- 并发/重复触发续跑：只有一个请求真正受理（`deduplicated=false`，
+  返回受理时刻的快照）；其余请求不重复触发，而是**等待本轮续跑结束后，
+  返回同一次执行的终态快照**（`deduplicated=true`）——各请求拿到的是一致结果，
+  而不是"执行中"的半截快照，也不会各跑一遍；
 - 对 `SUCCESS` 工作流续跑：无操作，直接返回既有执行（`deduplicated=true`）；
 - 对不存在的 `workflowId` 续跑：HTTP 404 `WORKFLOW_NOT_FOUND`；
 - 已结束工作流的**重复提交**（`POST /api/workflows`）行为不变，仍是返回既有执行，
@@ -162,7 +176,9 @@
 mvn test
 ```
 
-测试清单（共 30 个用例，日志中统一打印**工作流标识、步骤依赖关系、各步骤最终状态**）：
+测试清单（共 35 个用例，日志中统一打印**工作流标识、步骤依赖关系、各步骤最终状态**；
+全局测试扩展会在每个测试类开始时打印其覆盖的业务面、每个用例结束时打印通过/失败，
+`mvn test` 日志即可直接看出覆盖了哪些业务、各业务下用例及其结果）：
 
 - `DagValidationTest`：缺失依赖 / 自引用 / 成环拒绝原因可区分；拓扑序满足依赖且与提交顺序无关；
 - `StepFailureTest`：STEP_EXCEPTION 传播、TIMEOUT 分类、下游 SKIPPED、并发上限实测、
@@ -171,6 +187,10 @@ mvn test
   未配重试的老定义行为不变；
 - `ResumeTest`：续跑只补未成功部分、并发续跑只生效一次、已成功工作流续跑为空操作、
   未知 id 404、续跑中途重启可断点恢复且不重复执行；
+- `ResumeRetryTest`（续跑批次里的自动重试）：续跑里带重试的步骤重新获得完整重试预算并最终
+  重试成功、续跑里重试次数用尽才算真正失败（多轮续跑逐轮验证）、并发续跑各请求拿到
+  同一次续跑的一致终态结果、续跑中途重启后剩余重试预算与历史尝试记录如实保留、
+  续跑里的重试不突破并发上限；
 - `RestartRecoveryTest`：重复提交幂等、同 id 不同定义 409、kill 后重启已完成步骤不重跑、
   RUNNING 步骤恢复重跑、终态工作流重启后保持一致；
 - `WorkflowApiTest`：基于 MockMvc 的 HTTP 端到端冒烟（成功、成环 400、幂等、409、
@@ -217,6 +237,17 @@ sleep 3 && curl -s localhost:8080/api/workflows/retry-demo
 # 续跑用于演示幂等：重复调用返回 deduplicated=true 的同一份执行）
 curl -s -X POST localhost:8080/api/workflows/retry-demo/resume
 curl -s -X POST localhost:8080/api/workflows/retry-demo/resume   # 幂等命中，不会各跑一遍
+
+# 续跑批次里的自动重试：bad 配 maxRetries=2，第一轮 3 次尝试用尽后 FAILED；
+# 续跑后 bad 重新获得 3 次尝试预算——GET 可见 attempts 从 3 涨到 6（历史保留、跨轮累计），
+# attemptRecords 6 条，steps.bad.roundBaseAttempts=3 标识续跑轮基线；
+# 因为 bad 永远失败，本轮 3 次也用尽后才再次 FAILED，而不是续跑只跑一次就失败
+curl -s -X POST localhost:8080/api/workflows/retry-demo/resume
+sleep 3 && curl -s localhost:8080/api/workflows/retry-demo
+
+# 并发续跑一致性：并行发多个续跑请求，只有一个 deduplicated=false，
+# 其余请求会等本轮结束后返回同一次执行的终态快照（不是"执行中"的半截状态）
+for i in 1 2 3 4; do curl -s -X POST localhost:8080/api/workflows/retry-demo/resume & done; wait
 
 # 不存在的 id 续跑 → 404 WORKFLOW_NOT_FOUND
 curl -i -X POST localhost:8080/api/workflows/no-such/resume

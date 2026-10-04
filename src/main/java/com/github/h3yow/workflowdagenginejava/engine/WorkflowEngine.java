@@ -149,14 +149,18 @@ public class WorkflowEngine {
      * 失败工作流续跑（幂等）：
      * <ul>
      *   <li>FAILED：把 FAILED/SKIPPED 步骤重置为 PENDING 后重新调度；
-     *       已 SUCCESS 的步骤原样保留、绝不重跑，已记录的尝试次数与尝试记录保留不累加；</li>
-     *   <li>RUNNING：说明已有首次执行或另一次续跑正在进行，返回既有执行（deduplicated=true），
-     *       并发重复触发只生效一次；</li>
+     *       已 SUCCESS 的步骤原样保留、绝不重跑，已记录的尝试次数与尝试记录保留不累加；
+     *       每个被重置的步骤把重试基线抬到当前 attempts，本轮重新获得定义里配置的全部
+     *       重试次数，本轮次数用尽才算真正失败，与正常执行表现一致；</li>
+     *   <li>RUNNING：说明已有首次执行或另一次续跑正在进行，不重复触发；
+     *       等待本轮结束后返回同一次执行的终态快照（deduplicated=true），
+     *       并发重复触发只生效一次，且各请求拿到一致结果而非半截快照；</li>
      *   <li>SUCCESS：没有需要补跑的部分，返回既有执行（deduplicated=true）；</li>
      *   <li>workflowId 不存在：抛出 {@link WorkflowNotFoundException}（HTTP 404）。</li>
      * </ul>
      * 续跑把状态重置与状态落盘放在同一把锁内完成，之后由调度泵驱动，
-     * 跑到一半服务重启时按既有的断点恢复规则继续，已成功步骤不重跑。
+     * 跑到一半服务重启时按既有的断点恢复规则继续，已成功步骤不重跑，
+     * 重试基线随状态落盘，本轮剩余重试预算在重启后依然有效。
      */
     public SubmitOutcome resume(String workflowId) {
         ensurePools();
@@ -167,8 +171,14 @@ public class WorkflowEngine {
                 throw new WorkflowNotFoundException("workflowId=" + workflowId + " 不存在");
             }
             if (exec.getStatus() == WorkflowStatus.RUNNING) {
-                log.info("[workflowId={}] 续跑幂等命中：工作流正在执行中，返回既有执行", workflowId);
-                return new SubmitOutcome(true, snapshot(exec));
+                // 已有首次执行或另一次续跑在进行：不重复触发，等这一轮跑完后
+                // 返回同一次执行的终态快照，让并发/重复请求拿到一致结果而非半截快照
+                log.info("[workflowId={}] 续跑幂等命中：工作流正在执行中，等待本轮结束后返回一致结果",
+                        workflowId);
+                WorkflowExecution settled = awaitSettled(exec, lock);
+                log.info("[workflowId={}] 续跑幂等命中：本轮结束，返回状态={}",
+                        workflowId, settled.getStatus());
+                return new SubmitOutcome(true, snapshot(settled));
             }
             if (exec.getStatus() == WorkflowStatus.SUCCESS) {
                 log.info("[workflowId={}] 续跑幂等命中：工作流已成功结束，无需补跑", workflowId);
@@ -182,6 +192,9 @@ public class WorkflowEngine {
                     run.setStartedAt(0);
                     run.setFinishedAt(0);
                     run.setFailure(null);
+                    // 抬高本轮重试基线：历史 attempts/attemptRecords 原样保留，
+                    // 本轮重新获得定义里配置的全部重试次数
+                    run.setRoundBaseAttempts(run.getAttempts());
                     reset++;
                 }
             }
@@ -194,6 +207,22 @@ public class WorkflowEngine {
             startPump(workflowId);
             return new SubmitOutcome(false, snapshot(exec));
         }
+    }
+
+    /**
+     * 在当前工作流锁上等待其脱离 RUNNING（持有锁时调用，wait 会释放监视器让调度泵推进）。
+     * 被中断时恢复中断标记并返回当前状态，避免调用方线程被永久挂起。
+     */
+    private WorkflowExecution awaitSettled(WorkflowExecution exec, Object lock) {
+        while (exec.getStatus() == WorkflowStatus.RUNNING) {
+            try {
+                lock.wait(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return exec;
+            }
+        }
+        return exec;
     }
 
     public Optional<WorkflowExecution> get(String workflowId) {
@@ -305,7 +334,11 @@ public class WorkflowEngine {
         } else {
             StepDef step = DagValidator.indexById(exec.getDefinition()).get(outcome.stepId());
             int maxAttempts = 1 + (step == null ? 0 : step.maxRetries());
-            if (run.getAttempts() < maxAttempts) {
+            // 重试预算按"本轮"计算：本轮已派发次数 = 总 attempts - 轮次基线。
+            // 首次执行基线为 0，与引入基线前的行为完全一致；
+            // 续跑会把基线抬到当时的 attempts，本轮重新获得完整的重试次数。
+            int roundAttempts = run.getAttempts() - run.getRoundBaseAttempts();
+            if (roundAttempts < maxAttempts) {
                 // 重试次数未用尽：回到 PENDING 等待重试，不视为最终失败
                 run.setStatus(StepStatus.PENDING);
                 run.setFailure(null);
@@ -321,9 +354,9 @@ public class WorkflowEngine {
             run.setStatus(StepStatus.FAILED);
             run.setFailure(new FailureInfo(outcome.failureType(), outcome.stepId(), outcome.message()));
             state.failed = true;
-            log.warn("[workflowId={}] stepId={} 最终状态=FAILED/{} {}（共 {} 次尝试，重试次数已用尽）",
+            log.warn("[workflowId={}] stepId={} 最终状态=FAILED/{} {}（本轮 {} 次尝试已用尽，历史累计 {} 次）",
                     exec.getWorkflowId(), outcome.stepId(),
-                    outcome.failureType(), outcome.message(), run.getAttempts());
+                    outcome.failureType(), outcome.message(), roundAttempts, run.getAttempts());
         }
         persist(exec);
     }
@@ -424,6 +457,11 @@ public class WorkflowEngine {
             exec.setFailure(root);
         }
         persist(exec);
+        // 唤醒等待本轮结果的续跑幂等请求（finishAs 由调度泵在持有该锁时调用，可重入）
+        Object lock = lockFor(exec.getWorkflowId());
+        synchronized (lock) {
+            lock.notifyAll();
+        }
         log.info("[workflowId={}] 工作流结束，最终状态={}{}",
                 exec.getWorkflowId(), workflowStatus,
                 skipped > 0 ? "，跳过步骤数=" + skipped : "");
